@@ -1,12 +1,15 @@
 const MAXNAMELEN = 255;
 typedef string keyname<MAXNAMELEN>;
-enum status {OK, ERROR};
-enum type {READ, WRITE};
+enum status {ERROR, OK, UNALLOC};
+enum type {UNDEFINED, READ, WRITE, RELEASE};
+struct identity {
+	int id_arr[2];
+};
 struct lock_params {
 	keyname key;
 	type operation;
+	identity id;
 };
-typedef struct lock_params *lock_params;
 
 program LOCKSERVICEPROG {
 	version LOCKSERVICEVERS {
