@@ -9,6 +9,7 @@
 #include <rpc/rpc.h>
 
 #include <pthread.h>
+#include "fair_read_write_lock.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -51,6 +52,12 @@ typedef struct lock_item {
         pthread_cond_t cond;
         type operation;
 } lock_item;
+
+struct fair_lock_item {
+	type operation;
+	struct atomic_array readers_states;
+	struct atomic_int writer_state;
+};
 
 #define LOCKSERVICEPROG 0x20000002
 #define LOCKSERVICEVERS 1

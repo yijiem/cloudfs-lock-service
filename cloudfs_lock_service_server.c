@@ -11,6 +11,9 @@
 #include <sys/time.h>
 #include <errno.h>
 
+#define FAIR_LOCK_FLAG 1
+#define PRINT_LOG 0
+#define PRINT_LOG_MAIN 0
 
 void print_log(long tid, type operation, long key, const char *msg) {
         long sec, ms;
@@ -38,9 +41,16 @@ acquire_1_svc(lock_params *argp, status *result, struct svc_req *rqstp)
         keyname key_str;
         long key, tid;
         type operation;
-        lock_item *lock;
+        lock_item *lock1 = NULL;
+	struct fair_lock_item *lock2 = NULL;
         char start_msg[100];
         int machine, version;
+
+	if (argp == NULL) {
+		printf("argp == NULL!\n");
+		*result = 0;
+		return 0;
+	}
 
         /*
          * insert server code here
@@ -51,120 +61,179 @@ acquire_1_svc(lock_params *argp, status *result, struct svc_req *rqstp)
         key_str = argp->key;
         machine = argp->id.id_arr[0];
         version = argp->id.id_arr[1];
-        sprintf(start_msg, "Receive key:%s machine:%d version:%d in acquire", key_str, machine, version);
-        print_log(tid, operation, 0L, start_msg);
 
-        if (machine < 0 || machine >= 2 || version >= 5000 || version < 0) {
-                // arg1.key = (char *) malloc(5); // give you sth to free
-                *result = 0;
-                return TRUE;
-        }
+	if (PRINT_LOG) {
+        	sprintf(start_msg, "Receive key:%s machine:%d version:%d in acquire", key_str, machine, version);
+        	print_log(tid, operation, 0L, start_msg);
+	}
 
-        if (operation == UNDEFINED) {
-                // arg1.key = (char *) malloc(5); // give you sth to free
+        if (machine < 0 || machine >= 5 || version >= 5000 || version < 0 || operation == UNDEFINED ||
+		!(operation == READ || operation == WRITE) || key_str == NULL) { // RPC goes to wrong function
                 *result = 0;
-                return TRUE;
-        }
-
-        if (!(operation == READ || operation == WRITE)) { // RPC goes to wrong function
-                *result = 0;
-                return TRUE;
-        }
-
-        if (key_str == NULL) {
-                // arg1.key = (char *) malloc(5); // give you sth to free
-                *result = 0;
-                return TRUE;
+                return 0;
         }
 
         if (acquire_result_cache[machine][version] != UNALLOC) {
-                printf("hit!\n");
+		acquire_repeat_connect[machine][version] = 1;
+                if (PRINT_LOG) printf("hit!\n");
                 *result = acquire_result_cache[machine][version];
                 return TRUE;
         }
 
         acquire_result_cache[machine][version] = ERROR;
 
+        pthread_mutex_lock(&mutex); // lock here
         key = hashFunction(key_str, hash_map);
 
-        pthread_mutex_lock(&mutex); // lock here
-        lock = (lock_item *) hashmapGet(hash_map, key);
+        if (!FAIR_LOCK_FLAG) { lock1 = (lock_item *) hashmapGet(hash_map, key); }
+	else { lock2 = (struct fair_lock_item *) hashmapGet(hash_map, key); }
 
-        if (lock == NULL) {
-                print_log(tid, operation, key, "lock is new, create a new one..");
-                lock = malloc(sizeof(lock_item));
-                lock->i = 0;
-                pthread_mutex_init(&lock->mutex, NULL);
-                pthread_cond_init(&lock->cond, NULL);
-                hashmapInsert(hash_map, lock, key);
+        if (lock1 == NULL && lock2 == NULL) {
+                if (PRINT_LOG) print_log(tid, operation, key, "lock is new, create a new one..");
+		if (!FAIR_LOCK_FLAG) {
+               		lock1 = malloc(sizeof(lock_item));
+                	lock1->i = 0;
+                	pthread_mutex_init(&lock1->mutex, NULL);
+                	pthread_cond_init(&lock1->cond, NULL);
+                	hashmapInsert(hash_map, lock1, key);
+		} else {
+			lock2 = malloc(sizeof(struct fair_lock_item));
+			atomic_array_init(&lock2->readers_states);
+			atomic_int_init(&lock2->writer_state);
+                	hashmapInsert(hash_map, lock2, key);
+		}
                 pthread_mutex_unlock(&mutex); // unlock here
 
                 if (operation == READ) {
                         // acquire_read(lock);
-                        pthread_mutex_lock(&lock->mutex);
+			if (!FAIR_LOCK_FLAG) {
+                        	pthread_mutex_lock(&lock1->mutex);
 
-                        while (lock->i < 0) {
-                                pthread_cond_wait(&lock->cond, &lock->mutex);
-                        }
-                        lock->i = lock->i + 1;
-                        print_log(tid, operation, key, "grab read lock!");
-                        *result = OK;
-                        acquire_result_cache[machine][version] = OK;
-                        lock->operation = operation; // this is the next free operation for this key
+                        	while (lock1->i < 0) {
+                                	pthread_cond_wait(&lock1->cond, &lock1->mutex);
+                        	}
+                        	lock1->i = lock1->i + 1;
+                        	if (PRINT_LOG_MAIN) print_log(tid, operation, key, "grab read lock!");
+                        	*result = OK;
+                        	acquire_result_cache[machine][version] = OK;
+                        	lock1->operation = operation; // this is the next free operation for this key
 
-                        pthread_mutex_unlock(&lock->mutex);
-                        return TRUE;
+                        	pthread_mutex_unlock(&lock1->mutex);
+			} else {
+				read_lock(&lock2->readers_states, &lock2->writer_state, version, machine, (int)(tid % MAX_NUM_THREADS));
+				if (PRINT_LOG) {
+					print_log(tid, operation, key, "fair lock grab read lock!");
+					printf("local tid=%d\n", (int)(tid % MAX_NUM_THREADS));
+				}
+				acquire_result_cache[machine][version] = OK;
+                                lock2->operation = operation; // this is the next free operation for this key
+				*result = OK;
+				if (release_result_cache[machine][version] == OK) {
+                                        printf("you are so late....\n");
+                                        read_unlock(&lock2->readers_states, version, machine);
+                                }
+			}
+                        if (acquire_repeat_connect[machine][version]) return 0;
+			else return TRUE;
                 } else if (operation == WRITE) {
                         // acquire_write(lock);
-                        pthread_mutex_lock(&lock->mutex);
+			if (!FAIR_LOCK_FLAG) {
+                        	pthread_mutex_lock(&lock1->mutex);
 
-                        while (lock->i != 0) {
-                                pthread_cond_wait(&lock->cond, &lock->mutex);
-                        }
-                        lock->i = lock->i - 1;
-                        print_log(tid, operation, key, "grab write lock!");
-                        *result = OK;
-                        acquire_result_cache[machine][version] = OK;
-                        lock->operation = operation; // this is the next free operation for this key
+                        	while (lock1->i != 0) {
+                                	pthread_cond_wait(&lock1->cond, &lock1->mutex);
+                        	}
+                        	lock1->i = lock1->i - 1;
+                        	if (PRINT_LOG_MAIN) print_log(tid, operation, key, "grab write lock!");
+                        	*result = OK;
+                        	acquire_result_cache[machine][version] = OK;
+                        	lock1->operation = operation; // this is the next free operation for this key
 
-                        pthread_mutex_unlock(&lock->mutex);
-                        return TRUE;
+                        	pthread_mutex_unlock(&lock1->mutex);
+			} else {
+				write_lock(&lock2->readers_states, &lock2->writer_state, version, machine, (int)(tid % MAX_NUM_THREADS));
+				if (PRINT_LOG) {
+					print_log(tid, operation, key, "fair lock grab write lock!");
+					printf("local tid=%d\n", (int)(tid % MAX_NUM_THREADS));
+				}
+				acquire_result_cache[machine][version] = OK;
+                                lock2->operation = operation; // this is the next free operation for this key
+				*result = OK;
+				if (release_result_cache[machine][version] == OK) {
+                                        if (PRINT_LOG) printf("you are so late....\n");
+                                        write_unlock(&lock2->writer_state);
+                                }
+			}
+                        if (acquire_repeat_connect[machine][version]) return 0;
+			else return TRUE;
                 }
         } else {
-                print_log(tid, operation, key, "lock exist..");
-                printf("lock->i==%d\n", lock->i);
+                if (PRINT_LOG) print_log(tid, operation, key, "lock exist..");
+                // printf("lock->i==%d\n", lock->i);
                 pthread_mutex_unlock(&mutex); // or unlock here
                 if (operation == READ) {
                         // acquire_read(lock);
-                        pthread_mutex_lock(&lock->mutex);
+			if (!FAIR_LOCK_FLAG) {
+                        	pthread_mutex_lock(&lock1->mutex);
 
-                        while (lock->i < 0) {
-                                pthread_cond_wait(&lock->cond, &lock->mutex);
+                        	while (lock1->i < 0) {
+                                	pthread_cond_wait(&lock1->cond, &lock1->mutex);
+                        	}
+                        	lock1->i = lock1->i + 1;
+                        	if (PRINT_LOG_MAIN) print_log(tid, operation, key, "grab read lock!");
+                        	*result = OK;
+                        	acquire_result_cache[machine][version] = OK; // i see live people
+                        	lock1->operation = operation; // this is the next free operation for this key
+
+                        	pthread_mutex_unlock(&lock1->mutex);
+			} else {
+                                read_lock(&lock2->readers_states, &lock2->writer_state, version, machine, (int)(tid % MAX_NUM_THREADS));
+                                if (PRINT_LOG) {
+					print_log(tid, operation, key, "fair lock grab read lock!");
+					printf("local tid=%d\n", (int)(tid % MAX_NUM_THREADS));
+				}
+				acquire_result_cache[machine][version] = OK;
+                                lock2->operation = operation; // this is the next free operation for this key
+				*result = OK;
+				if (release_result_cache[machine][version] == OK) {
+                                        if (PRINT_LOG) printf("you are so late....\n");
+                                        read_unlock(&lock2->readers_states, version, machine);
+                                }
                         }
-                        lock->i = lock->i + 1;
-                        print_log(tid, operation, key, "grab read lock!");
-                        *result = OK;
-                        acquire_result_cache[machine][version] = OK; // i see live people
-                        lock->operation = operation; // this is the next free operation for this key
-
-                        pthread_mutex_unlock(&lock->mutex);
-                        return TRUE;
+                        if (acquire_repeat_connect[machine][version]) return 0;
+                        else return TRUE;
                 } else if (operation == WRITE) {
                         // acquire_write(lock);
-                        pthread_mutex_lock(&lock->mutex);
+			if (!FAIR_LOCK_FLAG) {
+                        	pthread_mutex_lock(&lock1->mutex);
 
-                        while (lock->i != 0) {
-                                pthread_cond_wait(&lock->cond, &lock->mutex);
+                        	while (lock1->i != 0) {
+                                	pthread_cond_wait(&lock1->cond, &lock1->mutex);
+                        	}
+                        	lock1->i = lock1->i - 1;
+                        	if (PRINT_LOG) print_log(tid, operation, key, "grab write lock!");
+                        	*result = OK;
+                        	acquire_result_cache[machine][version] = OK; // i see live people
+                        	lock1->operation = operation; // this is the next free operation for this key
+
+                        	pthread_mutex_unlock(&lock1->mutex);
+				if (PRINT_LOG) printf("Are you exit?\n");
+			} else {
+                                write_lock(&lock2->readers_states, &lock2->writer_state, version, machine, (int)(tid % MAX_NUM_THREADS));
+				if (PRINT_LOG) {
+					print_log(tid, operation, key, "fair lock grab write lock!");
+					printf("local tid=%d\n", (int)(tid % MAX_NUM_THREADS));
+				}
+                                acquire_result_cache[machine][version] = OK;
+                                lock2->operation = operation; // this is the next free operation for this key
+				*result = OK;
+				if (release_result_cache[machine][version] == OK) {
+					if (PRINT_LOG) printf("you are so late....\n");
+					write_unlock(&lock2->writer_state);
+				}
                         }
-                        lock->i = lock->i - 1;
-                        print_log(tid, operation, key, "grab write lock!");
-                        *result = OK;
-                        acquire_result_cache[machine][version] = OK; // i see live people
-                        lock->operation = operation; // this is the next free operation for this key
-
-                        pthread_mutex_unlock(&lock->mutex);
-                        return TRUE;
-
+                        if (acquire_repeat_connect[machine][version]) return 0;
+                        else return TRUE;
                 }
                 *result = OK;
         }
@@ -180,9 +249,16 @@ release_1_svc(lock_params *argp, status *result, struct svc_req *rqstp)
         keyname key_str;
         long key, tid;
         type operation;
-        lock_item *lock;
+        lock_item *lock1 = NULL;
+	struct fair_lock_item *lock2 = NULL;
         char start_msg[100];
         int machine, version;
+
+	if (argp == NULL) {
+		printf("argp == NULL!\n");
+		*result = 0;
+		return 0;
+	}
 
         /*
          * insert server code here
@@ -193,35 +269,26 @@ release_1_svc(lock_params *argp, status *result, struct svc_req *rqstp)
         key_str = argp->key;
         machine = argp->id.id_arr[0];
         version = argp->id.id_arr[1];
-        sprintf(start_msg, "Receive key:%s machine:%d version:%d in release", key_str, machine, version);
-        print_log(tid, operation, 0L, start_msg);
 
-        if (machine < 0 || machine >= 2 || version >= 5000 || version < 0) {
-                // arg1.key = (char *) malloc(5); // give you sth to free
-                *result = 0;
-                return TRUE;
-        }
+	if (PRINT_LOG) {
+        	sprintf(start_msg, "Receive key:%s machine:%d version:%d in release", key_str, machine, version);
+        	print_log(tid, operation, 0L, start_msg);
+	}
 
-        if (operation == UNDEFINED) {
-                // arg1.key = (char *) malloc(5); // give you sth to free
-                *result = 0;
-                return TRUE;
-        }
+        if (machine < 0 || machine >= 5 || version >= 5000 || version < 0 || operation == UNDEFINED || key_str == NULL) {
+		*result = 0;
+		return 0;
+	}
 
-        if (key_str == NULL) {
-                // arg1.key = (char *) malloc(5); // give you sth to free
-                *result = 0;
-                return TRUE;
-        }
-
-        if (release_result_cache[machine][version] != UNALLOC) {
-                printf("hit!\n");
+	if (release_result_cache[machine][version] != UNALLOC) {
+                if (PRINT_LOG) printf("hit!\n");
+		release_repeat_connect[machine][version] = 1;
                 *result = release_result_cache[machine][version];
                 return TRUE;
         }
 
         if (acquire_result_cache[machine][version] == UNALLOC) { // nothing but skip
-                printf("No acquire when release...May lose packet...skip!\n");
+                if (PRINT_LOG) printf("No acquire when release...May lose packet...skip!\n");
                 *result = OK;
                 return TRUE;
         }
@@ -230,60 +297,101 @@ release_1_svc(lock_params *argp, status *result, struct svc_req *rqstp)
         tid = syscall(SYS_gettid);
 
         // pthread_mutex_lock(&mutex); // lock here
-        lock = (lock_item *) hashmapGet(hash_map, key);
+        if (!FAIR_LOCK_FLAG) { lock1 = (lock_item *) hashmapGet(hash_map, key); }
+	else { lock2 = (struct fair_lock_item *) hashmapGet(hash_map, key); }
         // pthread_mutex_unlock(&mutex);
 
-        if (lock == NULL) {
+        if (lock1 == NULL && lock2 == NULL) {
                 // arg1.key = (char *) malloc(5); // give you sth to free
                 *result = 0;
-                return TRUE;
+                return 0;
         }
 
         release_result_cache[machine][version] = ERROR;
 
         memset(start_msg, 0, sizeof(start_msg));
-        if (lock->operation == READ && acquire_result_cache[machine][version] == ERROR) { // indicate acquire has been passed
-                pthread_mutex_lock(&lock->mutex);
+        // if (((lock1 != NULL && lock1->operation == READ) || (lock2 != NULL && lock2->operation == READ)) &&
+	if (acquire_result_cache[machine][version] == ERROR) { // indicate acquire has been passed
+		if (!FAIR_LOCK_FLAG) {
+                	pthread_mutex_lock(&lock1->mutex);
 
-                pthread_cond_signal(&lock->cond);
+                	pthread_cond_signal(&lock1->cond);
+			if (PRINT_LOG) {
+                		sprintf(start_msg, "<-----skip this version, release read key:%ld lock->i=%d----->", key, lock1->i);
+                		print_log(tid, operation, key, start_msg);
+			}
+                	*result = OK;
+                	release_result_cache[machine][version] = OK; //  pass this version
 
-                sprintf(start_msg, "<-----skip this version, release read key:%ld lock->i=%d----->", key, lock->i);
-                print_log(tid, operation, key, start_msg);
-                *result = OK;
-                release_result_cache[machine][version] = OK; //  pass this version
-
-                pthread_mutex_unlock(&lock->mutex);
-                return TRUE;
+                	pthread_mutex_unlock(&lock1->mutex);
+                	if (release_repeat_connect[machine][version]) return 0;
+			else return TRUE;
+		} else {
+			if (PRINT_LOG) printf("need to handle this case! pass!\n");
+			release_result_cache[machine][version] = OK;
+			*result = OK;
+			return TRUE;
+		}
         }
 
-        if (lock->operation == READ) {
+        if ((lock1 != NULL && lock1->operation == READ) || (lock2 != NULL && lock2->operation == READ)) {
                 // release_read(lock);
-                pthread_mutex_lock(&lock->mutex);
+		if (!FAIR_LOCK_FLAG) {
+                	pthread_mutex_lock(&lock1->mutex);
 
-                lock->i = lock->i - 1;
-                if (lock->i == 0) {
-                        pthread_cond_signal(&lock->cond);
-                }
-                sprintf(start_msg, "<-----release read key:%ld lock->i=%d----->", key, lock->i);
-                print_log(tid, operation, key, start_msg);
-                *result = OK;
-                release_result_cache[machine][version] = OK;
+                	lock1->i = lock1->i - 1;
+                	if (lock1->i == 0) {
+                        	pthread_cond_signal(&lock1->cond);
+                	}
+			if (PRINT_LOG) {
+                		sprintf(start_msg, "<-----release read key:%ld lock->i=%d----->", key, lock1->i);
+                		print_log(tid, operation, key, start_msg);
+			}
+                	*result = OK;
+                	release_result_cache[machine][version] = OK;
 
-                pthread_mutex_unlock(&lock->mutex);
-                return TRUE;
-        } else if (lock->operation == WRITE) {
+                	pthread_mutex_unlock(&lock1->mutex);
+                	if (release_repeat_connect[machine][version]) return 0;
+                        else return TRUE;
+		} else {
+			read_unlock(&lock2->readers_states, version, machine);
+			if (PRINT_LOG) {
+				sprintf(start_msg, "<-----fair lock release read key:%ld----->", key);
+                        	print_log(tid, operation, key, start_msg);
+			}
+			*result = OK;
+                        release_result_cache[machine][version] = OK;
+			if (release_repeat_connect[machine][version]) return 0;
+                        else return TRUE;
+		}
+        } else if ((lock1 != NULL && lock1->operation == WRITE) || (lock2 != NULL && lock2->operation == WRITE)) {
                 // release_write(lock);
-                pthread_mutex_lock(&lock->mutex);
+		if (!FAIR_LOCK_FLAG) {
+                	pthread_mutex_lock(&lock1->mutex);
 
-                lock->i = 0;
-                pthread_cond_broadcast(&lock->cond);
-                sprintf(start_msg, "<-----release write key:%ld lock->i=%d----->", key, lock->i);
-                print_log(tid, operation, key, start_msg);
-                *result = OK;
-                release_result_cache[machine][version] = OK;
+                	lock1->i = 0;
+                	pthread_cond_broadcast(&lock1->cond);
+                	if (PRINT_LOG) {
+				sprintf(start_msg, "<-----release write key:%ld lock->i=%d----->", key, lock1->i);
+                		print_log(tid, operation, key, start_msg);
+			}
+                	*result = OK;
+                	release_result_cache[machine][version] = OK;
 
-                pthread_mutex_unlock(&lock->mutex);
-                return TRUE;
+                	pthread_mutex_unlock(&lock1->mutex);
+                	if (release_repeat_connect[machine][version]) return 0;
+                        else return TRUE;
+		} else {
+			write_unlock(&lock2->writer_state);
+			if (PRINT_LOG) {
+				sprintf(start_msg, "<-----fair lock release read key:%ld----->", key);
+                        	print_log(tid, operation, key, start_msg);
+			}
+                        *result = OK;
+                        release_result_cache[machine][version] = OK;
+                        if (release_repeat_connect[machine][version]) return 0;
+                        else return TRUE;
+		}
         }
 
         return TRUE;

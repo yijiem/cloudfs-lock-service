@@ -12,9 +12,9 @@ SOURCES_SVC.c =
 SOURCES_SVC.h = cloudfs_lock_service_svc.h
 SOURCES.x = cloudfs_lock_service.x
 
-TARGETS_SVC.c = cloudfs_lock_service_svc.c cloudfs_lock_service_server.c cloudfs_lock_service_xdr.c hashmap.c
+TARGETS_SVC.c = cloudfs_lock_service_svc.c cloudfs_lock_service_server.c cloudfs_lock_service_xdr.c hashmap.c fair_read_write_lock.c
 TARGETS_CLNT.c = cloudfs_lock_service_clnt.c cloudfs_lock_service_client.c cloudfs_lock_service_xdr.c 
-TARGETS = cloudfs_lock_service.h cloudfs_lock_service_xdr.c cloudfs_lock_service_clnt.c cloudfs_lock_service_svc.c cloudfs_lock_service_client.c cloudfs_lock_service_server.c hashmap.c
+TARGETS = cloudfs_lock_service.h cloudfs_lock_service_xdr.c cloudfs_lock_service_clnt.c cloudfs_lock_service_svc.c cloudfs_lock_service_client.c cloudfs_lock_service_server.c hashmap.c fair_read_write_lock.c
 
 OBJECTS_CLNT = $(SOURCES_CLNT.c:%.c=%.o) $(TARGETS_CLNT.c:%.c=%.o)
 OBJECTS_SVC = $(SOURCES_SVC.c:%.c=%.o) $(TARGETS_SVC.c:%.c=%.o)
